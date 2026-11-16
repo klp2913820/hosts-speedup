@@ -17,8 +17,10 @@
 **镜像写法**：把 GitHub 原始链接整段接在前缀后面。
 
 ```
-https://ghfast.top/https://github.com/klp2913820/hosts-speedup/releases/download/v1.1.1/HostsSpeedup.exe
+https://ghfast.top/https://github.com/klp2913820/hosts-speedup/releases/latest/download/HostsSpeedup.exe
 ```
+
+> 用 `releases/latest/download/文件名` 这种写法，升级后链接不用改。
 
 > ⚠️ 上面是**第三方**反向代理，与本项目无关、随时可能失效，也可能记录请求内容。
 > 只用来下公开的发布文件，**不要在里面输入任何账号密码**。失效了就换一个前缀，或直接走源码运行。

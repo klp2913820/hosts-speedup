@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 APP_NAME = "Hosts 加速工具"
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 APP_DESC = "为 GitHub 等域名的访问挑选最快节点并写入系统 hosts"
 DISCLAIMER = "开源工具，与 GitHub, Inc. 无任何关联；GitHub 是其注册商标。"
 
@@ -143,6 +143,7 @@ class Probe:
     verified: bool          # TLS 证书是否匹配域名
     ok_samples: int
     speed: float | None = None   # 实测下载速度 MB/s（仅深度测速的文件类域名）
+    serves: bool = False         # 该节点是否真的能返回这个域名的内容（HTTP 状态行）
 
     @property
     def score(self) -> float:
@@ -322,6 +323,27 @@ def tls_ok(ip: str, domain: str, timeout: float = 2.5) -> bool:
         return False
 
 
+def serves_http(ip: str, domain: str, timeout: float = 4.0) -> bool:
+    """验证这个节点真的能对应该域名返回内容：TLS 握手后发一个请求，收到 HTTP 状态行即算可用。
+    只做 TLS 握手不够——有些节点能握手，但早就不能提供服务了（过期边缘、被限速、劫持残留）。"""
+    ctx = ssl.create_default_context()
+    try:
+        with socket.create_connection((ip, TCP_PORT), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=domain) as s:
+                s.settimeout(timeout)
+                s.sendall(
+                    f"HEAD / HTTP/1.1\r\nHost: {domain}\r\n"
+                    f"User-Agent: HostsSpeedup/{APP_VERSION}\r\nConnection: close\r\n\r\n".encode()
+                )
+                head = s.recv(64)
+    except (ssl.SSLError, OSError):
+        return False
+    if not head.startswith(b"HTTP/"):
+        return False
+    status = head[9:12]
+    return status not in (b"500", b"502", b"503", b"504")
+
+
 def measure_download(ip: str, domain: str, path: str,
                      cap: int = DOWNLOAD_CAP, budget: float = DOWNLOAD_BUDGET) -> float | None:
     """直连指定 IP（SNI 用真实域名）下载一小段，返回 MB/s。失败返回 None。"""
@@ -383,19 +405,21 @@ def probe(ip: str, domain: str) -> Probe | None:
             continue
     if not latencies:
         return None
+    verified = tls_ok(ip, domain)
     return Probe(
         ip=ip,
         latency=statistics.median(latencies),
         best=min(latencies),
-        verified=tls_ok(ip, domain),
+        verified=verified,
         ok_samples=len(latencies),
+        serves=serves_http(ip, domain) if verified else False,
     )
 
 
 def rank_key(p: Probe):
-    """证书有效优先；有下载速度的按速度降序，其余按延迟升序。"""
+    """证书有效 + 能真正返回内容优先；有下载速度的按速度降序，其余按延迟升序。"""
     has_speed = p.speed is not None
-    return (not p.verified, 0 if has_speed else 1, -(p.speed or 0.0), p.latency)
+    return (not p.verified, not p.serves, 0 if has_speed else 1, -(p.speed or 0.0), p.latency)
 
 
 def pick_best(domain: str, ips: list[str], deep: bool = True, log=log_default) -> DomainResult:
@@ -411,12 +435,12 @@ def pick_best(domain: str, ips: list[str], deep: bool = True, log=log_default) -
         res.error = "全部连接失败"
         return res
 
-    probes.sort(key=lambda p: (not p.verified, p.latency))
+    probes.sort(key=lambda p: (not p.verified, not p.serves, p.latency))
 
     # 深度测速：只对文件类域名的前 N 个候选做真实下载
     test_path = FILE_DOWNLOAD_TESTS.get(domain)
     if deep and test_path:
-        targets = [p for p in probes if p.verified][:DOWNLOAD_TOP_N]
+        targets = [p for p in probes if p.verified and p.serves][:DOWNLOAD_TOP_N]
         if targets:
             with ThreadPoolExecutor(max_workers=len(targets)) as pool:
                 speeds = list(pool.map(lambda p: measure_download(p.ip, domain, test_path), targets))
@@ -562,16 +586,55 @@ def comment_out_conflicts(content: str) -> tuple[str, list[str]]:
     return "".join(out), disabled
 
 
-def update_hosts(results: list[DomainResult], per_domain: int = 1, log=log_default) -> bool:
-    verified = [r for r in results if r.best and r.best.verified]
-    unverified = [r for r in results if r.best and not r.best.verified]
-    usable = verified + unverified if ALLOW_UNVERIFIED else verified
+# 写入后是否用系统解析真连一遍（发现连不上就自动换备用节点）
+VERIFY_AFTER_WRITE = True
 
-    if unverified and not ALLOW_UNVERIFIED:
-        names = "、".join(r.domain for r in unverified)
-        log(f"   · 跳过 {len(unverified)} 个证书异常的域名：{names}")
+_HTTP_OK = {200, 204, 206, 301, 302, 303, 307, 308, 403, 404, 429}
+
+
+def probe_serves(domain: str, timeout: float = 8.0) -> tuple[bool, str]:
+    """走系统解析（此时已含 hosts 记录）真实请求一次，判断能不能连上。"""
+    url = f"https://{domain}/"
+    req = urllib.request.Request(url, headers={"user-agent": f"HostsSpeedup/{APP_VERSION}"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status in _HTTP_OK, f"HTTP {resp.status}"
+    except urllib.error.HTTPError as exc:
+        return exc.code in _HTTP_OK, f"HTTP {exc.code}"
+    except Exception as exc:  # 超时 / 连接被重置 / TLS 失败
+        return False, type(exc).__name__
+
+
+def verify_written(results: list[DomainResult], log=log_default) -> list[str]:
+    """写入后自检：这些域名现在到底能不能访问。返回失败的域名列表。"""
+    flush_dns(log)
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        outcomes = list(pool.map(lambda r: probe_serves(r.domain), results))
+    bad = []
+    for r, (ok, detail) in zip(results, outcomes):
+        if not ok:
+            log(f"   ⚠ 自检失败：{r.domain:<38} {detail}")
+            bad.append(r.domain)
+    if not bad:
+        log(f"   ✓ 自检通过：{len(results)} 个域名均可访问")
+    return bad
+
+
+def update_hosts(results: list[DomainResult], per_domain: int = 1, log=log_default) -> bool:
+    def usable_now() -> list[DomainResult]:
+        return [r for r in results if r.best and r.best.verified and r.best.serves]
+
+    usable = usable_now()
+    if not usable and ALLOW_UNVERIFIED:
+        usable = [r for r in results if r.best]
+
+    skipped = [r for r in results
+               if r.best and r not in usable]
+    if skipped:
+        names = "、".join(r.domain for r in skipped)
+        log(f"   · 跳过 {len(skipped)} 个没有可用节点的域名：{names}")
     if not usable:
-        log("   ✗ 没有证书有效的节点，hosts 未修改")
+        log("   ✗ 没有验证通过的节点，hosts 未修改")
         return False
 
     log("③ 写入 hosts…")
@@ -588,16 +651,16 @@ def update_hosts(results: list[DomainResult], per_domain: int = 1, log=log_defau
             log(f"      {line}")
         if len(disabled) > 5:
             log(f"      ……另有 {len(disabled) - 5} 条")
-    block = build_block(usable, per_domain)
-    if cleaned.strip():
-        if not cleaned.endswith(("\n", "\r\n")):
-            cleaned = cleaned.rstrip("\r\n") + "\r\n"
-        new_content = cleaned + "\r\n" + block
-    else:
-        new_content = block
+
+    def compose(entries: list[DomainResult]) -> str:
+        block = build_block(entries, per_domain)
+        if cleaned.strip():
+            base = cleaned if cleaned.endswith(("\n", "\r\n")) else cleaned.rstrip("\r\n") + "\r\n"
+            return base + "\r\n" + block
+        return block
 
     try:
-        write_text(HOSTS_PATH, new_content)
+        write_text(HOSTS_PATH, compose(usable))
     except PermissionError:
         log("   ✗ 没有写入权限，请以管理员身份运行")
         return False
@@ -606,13 +669,39 @@ def update_hosts(results: list[DomainResult], per_domain: int = 1, log=log_defau
         return False
 
     # 回读校验
-    check = read_text(HOSTS_PATH)
-    if block.strip().splitlines()[0] not in check:
+    if MARK_BEGIN not in read_text(HOSTS_PATH):
         log("   ✗ 写入后校验失败（可能被杀毒软件拦截）")
         return False
 
     log(f"   ✓ 已写入 {len(usable)} 个域名")
-    flush_dns(log)
+
+    # 写后自检 + 自动换备用
+    if VERIFY_AFTER_WRITE:
+        bad = verify_written(usable, log)
+        if bad:
+            log("   · 尝试切换到备用节点…")
+            fixed = 0
+            for r in usable:
+                if r.domain not in bad:
+                    continue
+                for alt in r.backups:
+                    if alt.serves or serves_http(alt.ip, r.domain):
+                        alt.serves = True
+                        r.best = alt
+                        fixed += 1
+                        log(f"     {r.domain} → {alt.ip}")
+                        break
+            if fixed:
+                try:
+                    write_text(HOSTS_PATH, compose(usable))
+                    still_bad = verify_written(usable, log)
+                except OSError as exc:
+                    log(f"   ✗ 备用节点写入失败：{exc}")
+                    still_bad = bad
+                if still_bad:
+                    log(f"   ⚠ {len(still_bad)} 个域名仍不可用，建议稍后重跑一次测速")
+            else:
+                log("   ⚠ 没有可替换的备用节点，建议稍后重跑一次测速")
     return True
 
 

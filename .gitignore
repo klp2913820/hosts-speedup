@@ -1,0 +1,24 @@
+# 构建产物（由 build_exe.bat 生成，不需要提交）
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 运行时日志
+*.log
+last_run.log
+
+# hosts 备份（万一被复制到仓库目录里）
+hosts.bak
+hosts.2*
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# 编辑器
+.vscode/
+.idea/

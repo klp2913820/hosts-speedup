@@ -6,6 +6,39 @@
 
 自动为一批 GitHub 相关域名挑选**当前最快且证书有效**的节点，写进系统 hosts，改善解析慢、图裂、拉取卡顿的问题。
 
+## 下载
+
+| 方式 | 适合谁 | 说明 |
+|---|---|---|
+| **Releases 直链** | 首选 | [下载最新版 `HostsSpeedup.exe`](https://github.com/klp2913820/hosts-speedup/releases/latest)，单文件、免安装、启动自动请求管理员权限 |
+| **国内加速镜像** | 打不开 Releases 时 | 在原始链接前面加一个第三方代理前缀，见下方 |
+| **源码运行** | 想自己看代码 / 自己打包 | 只依赖 Python 标准库，无第三方包 |
+
+**镜像写法**：把 GitHub 原始链接整段接在前缀后面。
+
+```
+https://ghfast.top/https://github.com/klp2913820/hosts-speedup/releases/download/v1.1.1/HostsSpeedup.exe
+```
+
+> ⚠️ 上面是**第三方**反向代理，与本项目无关、随时可能失效，也可能记录请求内容。
+> 只用来下公开的发布文件，**不要在里面输入任何账号密码**。失效了就换一个前缀，或直接走源码运行。
+
+**源码运行**（需要 Python 3.10+，实测 3.14）：
+
+```powershell
+git clone https://github.com/klp2913820/hosts-speedup.git
+cd hosts-speedup
+python hosts_speedup.py
+```
+
+**校验下载的文件**（可选的保险做法）：
+
+```powershell
+Get-FileHash .\HostsSpeedup.exe -Algorithm SHA256
+```
+
+> 本项目没有代码签名证书，Windows SmartScreen 首次运行会提示"未知发布者"，需要点「更多信息 → 仍要运行」。
+
 ## 原理
 
 ```
@@ -196,6 +229,13 @@ build_exe.bat
 安装 PyInstaller 并打包 `dist\HostsSpeedup.exe`（单文件、无控制台窗口、启动自动提权）。
 
 > PyInstaller 采用 GPL + bootloader exception，允许分发打包后的程序；Python 本身使用 PSF 许可证。
+
+发布时把 `dist\HostsSpeedup.exe` 作为附件传到 GitHub Releases（tag 与 `APP_VERSION` 保持一致），
+并在发布说明里附上 SHA256：
+
+```powershell
+Get-FileHash dist\HostsSpeedup.exe -Algorithm SHA256
+```
 
 ## 许可
 

@@ -39,7 +39,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 APP_NAME = "Hosts 加速工具"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 APP_DESC = "为 GitHub 等域名的访问挑选最快节点并写入系统 hosts"
 DISCLAIMER = "开源工具，与 GitHub, Inc. 无任何关联；GitHub 是其注册商标。"
 
@@ -47,6 +47,12 @@ HOSTS_PATH = r"C:\Windows\System32\drivers\etc\hosts"
 HOSTS_BACKUP = HOSTS_PATH + ".bak"
 MARK_BEGIN = "# >>> hosts-speedup >>>"
 MARK_END = "# <<< hosts-speedup <<<"
+
+# 历史版本的标记（改名前的 github-hosts-tool）。
+# 写入时要把这些旧块一起清掉，否则旧块会留在 hosts 里变成"孤儿"，里面的过期 IP 会先被命中。
+LEGACY_MARKS = [
+    ("# >>> github-hosts-tool >>>", "# <<< github-hosts-tool <<<"),
+]
 
 # 需要加速的域名
 DOMAINS = [
@@ -525,11 +531,35 @@ def build_block(results: list[DomainResult], per_domain: int = 1) -> str:
 
 
 def strip_block(content: str) -> str:
-    pattern = re.compile(
-        r"\r?\n?" + re.escape(MARK_BEGIN) + r".*?" + re.escape(MARK_END) + r"[ \t]*\r?\n?",
-        re.DOTALL,
-    )
-    return pattern.sub("\n", content)
+    """删掉本程序的区块，以及历史版本（改名前）遗留的孤儿块。"""
+    for begin, end in [(MARK_BEGIN, MARK_END)] + LEGACY_MARKS:
+        pattern = re.compile(
+            r"\r?\n?" + re.escape(begin) + r".*?" + re.escape(end) + r"[ \t]*\r?\n?",
+            re.DOTALL,
+        )
+        content = pattern.sub("\n", content)
+    return content
+
+
+CONFLICT_PREFIX = "# [hosts-speedup 已停用] "
+
+
+def comment_out_conflicts(content: str) -> tuple[str, list[str]]:
+    """把区块外指向本工具域名的记录注释掉（原内容保留，方便手动恢复）。
+    不这么做的话，别的工具或旧版本写下的过期 IP 可能抢先命中，导致"刚还能上，现在打不开"。"""
+    domains = {d.lower() for d in DOMAINS}
+    out: list[str] = []
+    disabled: list[str] = []
+    for line in content.splitlines(True):
+        body = line.split("#", 1)[0].strip()
+        parts = body.split()
+        if body and len(parts) >= 2 and parts[1].lower() in domains:
+            eol = "\r\n" if line.endswith("\r\n") else ("\n" if line.endswith("\n") else "\r\n")
+            out.append(CONFLICT_PREFIX + body + eol)
+            disabled.append(body)
+        else:
+            out.append(line)
+    return "".join(out), disabled
 
 
 def update_hosts(results: list[DomainResult], per_domain: int = 1, log=log_default) -> bool:
@@ -548,7 +578,16 @@ def update_hosts(results: list[DomainResult], per_domain: int = 1, log=log_defau
     backup_hosts(log)
 
     original = read_text(HOSTS_PATH)
+    if any(begin in original for begin, _ in LEGACY_MARKS):
+        log("   · 已清理旧版本遗留的标记块")
     cleaned = strip_block(original)
+    cleaned, disabled = comment_out_conflicts(cleaned)
+    if disabled:
+        log(f"   · 已停用 {len(disabled)} 条其他程序写入的同类记录（保留为注释，可手动恢复）：")
+        for line in disabled[:5]:
+            log(f"      {line}")
+        if len(disabled) > 5:
+            log(f"      ……另有 {len(disabled) - 5} 条")
     block = build_block(usable, per_domain)
     if cleaned.strip():
         if not cleaned.endswith(("\n", "\r\n")):
